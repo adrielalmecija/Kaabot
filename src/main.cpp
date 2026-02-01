@@ -13,6 +13,7 @@
 #define PIN_SDA     21
 #define PIN_SCL     22
 Adafruit_SH1106G display(OLED_W, OLED_H, &Wire, OLED_RESET);
+bool oledOk = false;
 
 // ---- DHT22 ----
 #define DHTTYPE    DHT22
@@ -27,10 +28,37 @@ float t2 = NAN, h2 = NAN;
 
 unsigned long lastReadMs = 0;
 
-// ---- Reloj mock para header (opcional) ----
+// ---- Relés (módulo 6 relés) ----
+// IN1->GPIO25, IN2->GPIO26, IN3->GPIO27, IN4->GPIO32, IN5->GPIO33, IN6->GPIO23
+constexpr int RELAY_PINS[6] = {25, 26, 27, 32, 33, 23};
+
+// La mayoría de módulos: ACTIVE LOW (LOW=ON, HIGH=OFF)
+// Si es al revés, poné:
+// constexpr uint8_t RELAY_ON  = HIGH;
+// constexpr uint8_t RELAY_OFF = LOW;
+constexpr uint8_t RELAY_ON  = LOW;
+constexpr uint8_t RELAY_OFF = HIGH;
+
+bool relayState[6] = {false, false, false, false, false, false}; // false=OFF, true=ON
+
+static void setRelay(int idx, bool on) {
+  relayState[idx] = on;
+  digitalWrite(RELAY_PINS[idx], on ? RELAY_ON : RELAY_OFF);
+}
+
+static void setAllRelays(bool on) {
+  for (int i = 0; i < 6; i++) setRelay(i, on);
+}
+
+// ---- Reloj mock ----
 uint8_t hh = 12, mm = 0;
 bool blinkColon = true;
 unsigned long lastTick = 0, lastUi = 0;
+
+// ---- Test relés ----
+bool doRelayTest = true;            // poné false cuando termines
+unsigned long lastRelayStep = 0;
+int relayIdx = 0;
 
 static void printDegC() {
   display.write(248); // °
@@ -42,7 +70,7 @@ static void fmtFloat(char *out, size_t outLen, float v, int width = 4, int dec =
     strncpy(out, "--.-", outLen);
     out[outLen - 1] = '\0';
   } else {
-    dtostrf(v, width, dec, out); // ancho fijo para que no “wrappee”
+    dtostrf(v, width, dec, out);
   }
 }
 
@@ -55,7 +83,6 @@ void drawHeader() {
   display.setCursor(0, 0);
   display.print(buf);
 
-  // Estado sensores (sin ocupar mucho)
   display.setCursor(50, 0);
   display.print("D1:");
   display.print((isnan(t1) || isnan(h1)) ? "--" : "OK");
@@ -71,70 +98,93 @@ void drawTempsAndHumidity() {
   fmtFloat(bT2, sizeof(bT2), t2);
   fmtFloat(bH2, sizeof(bH2), h2);
 
-  // ---- Bloque 1 (arriba) ----
-  // Temperatura 1 grande
+  // Bloque 1
   display.setTextSize(1);
   display.setCursor(0, 8);
   display.print("T1:");
 
   display.setTextSize(2);
-  display.setCursor(22, 8);          // y=8 ocupa 16px (hasta y=23)
+  display.setCursor(22, 8);
   display.print(bT1);
   printDegC();
 
-  // Humedad 1 debajo (sin solape)
   display.setTextSize(1);
-  display.setCursor(0, 24);          // línea justo debajo del size2
+  display.setCursor(0, 24);
   display.print("H1:");
   display.print(bH1);
   display.print("%");
 
-  // ---- Bloque 2 (abajo) ----
+  // Bloque 2
   display.setTextSize(1);
   display.setCursor(0, 32);
   display.print("T2:");
 
   display.setTextSize(2);
-  display.setCursor(22, 32);         // y=32 ocupa 16px (hasta y=47)
+  display.setCursor(22, 32);
   display.print(bT2);
   printDegC();
 
   display.setTextSize(1);
-  display.setCursor(0, 48);          // debajo de T2
+  display.setCursor(0, 48);
   display.print("H2:");
   display.print(bH2);
   display.print("%");
+}
+
+void drawRelayStatus() {
+  // Línea inferior: R:101010
+  display.setTextSize(1);
+  display.setCursor(78, 56);
+  display.print("R:");
+  for (int i = 0; i < 6; i++) display.print(relayState[i] ? '1' : '0');
 }
 
 void drawUI() {
   display.clearDisplay();
   drawHeader();
   drawTempsAndHumidity();
+  drawRelayStatus();
   display.display();
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(200);
+  Serial.println("\n=== Terrario start ===");
 
+  // Relés: configurar y dejar OFF (esto debería pasar siempre)
+  for (int i = 0; i < 6; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], RELAY_OFF);
+    relayState[i] = false;
+  }
+  Serial.println("Relays init -> OFF");
+
+  // OLED
   Wire.begin(PIN_SDA, PIN_SCL);
-  if (!display.begin(OLED_ADDR, true)) {
-    Serial.println("OLED no detectado");
-    while (1) delay(100);
+  oledOk = display.begin(OLED_ADDR, true);
+  if (!oledOk) {
+    Serial.println("OLED NO detectado (revisar 3V3/GND/SDA21/SCL22)");
+  } else {
+    display.cp437(true);
+    display.setTextWrap(false);
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0); display.println("Terrario 2xDHT22");
+    display.setCursor(0, 8); display.println("Init OK");
+    display.setCursor(0, 16); display.println("Relays: OFF");
+    display.display();
+    delay(400);
   }
 
-  display.cp437(true);        // permite ° con 248
-  display.setTextWrap(false); // evita saltos de linea automáticos
-
+  // DHTs
   dht1.begin();
   delay(20);
   dht2.begin();
 
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 0); display.println("Terrario 2xDHT22");
-  display.setCursor(0, 8); display.println("Init...");
-  display.display();
-  delay(600);
+  Serial.println("DHT init OK");
+  Serial.println("Asegurate GND comun: ESP32 GND <-> MB102 GND <-> Relay GND");
 }
 
 void loop() {
@@ -147,7 +197,7 @@ void loop() {
     if (++mm >= 60) { mm = 0; hh = (hh + 1) % 24; }
   }
 
-  // leer cada 2s
+  // leer DHT cada 2s
   if (now - lastReadMs >= 2000) {
     lastReadMs = now;
 
@@ -166,8 +216,23 @@ void loop() {
     Serial.printf("D1 T=%.1fC H=%.1f%% | D2 T=%.1fC H=%.1f%%\n", t1, h1, t2, h2);
   }
 
-  // refresco UI
-  if (now - lastUi >= 250) {
+  // Test relés: enciende solo uno a la vez
+  if (doRelayTest && (now - lastRelayStep >= 700)) {
+    lastRelayStep = now;
+
+    // apagar todos
+    setAllRelays(false);
+
+    // encender uno
+    setRelay(relayIdx, true);
+    Serial.printf("Relay %d ON\n", relayIdx + 1);
+
+    relayIdx++;
+    if (relayIdx >= 6) relayIdx = 0;
+  }
+
+  // UI
+  if (oledOk && (now - lastUi >= 250)) {
     lastUi = now;
     drawUI();
   }
