@@ -1,18 +1,31 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <time.h>
+#include "secrets.h"
+
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
-#include <WiFi.h>
-#include "secrets.h"
-
 
 // =====================
 // WIFI CONFIG
 // =====================
-const char* WIFI_SSID = WIFI_SSID_SECRET;
-const char* WIFI_PASS = WIFI_PASS_SECRET;
+static const char* WIFI_SSID = WIFI_SSID_SECRET;
+static const char* WIFI_PASS = WIFI_PASS_SECRET;
+
+// =====================
+// NTP CONFIG
+// =====================
+static const char* TZ_INFO = "ART3";
+static const char* NTP1 = "pool.ntp.org";
+static const char* NTP2 = "time.google.com";
+static const char* NTP3 = "time.nist.gov";
+
+// Re-sync cada 24h (no bloqueante)
+static const uint32_t NTP_RESYNC_MS = 24UL * 60UL * 60UL * 1000UL; // 86400000 ms
+static unsigned long lastNtpResyncMs = 0;
 
 // =====================
 // OLED
@@ -38,39 +51,25 @@ DHT dht2(DHT2_PIN, DHTTYPE);
 float t1 = NAN, h1 = NAN;
 float t2 = NAN, h2 = NAN;
 unsigned long lastReadMs = 0;
+unsigned long lastUi = 0;
 
 // =====================
-// RELAYS (6 ch)
+// RELAYS
 // =====================
 constexpr int RELAY_PINS[6] = {25, 26, 27, 32, 33, 23};
-
-// Si tu módulo es active-low (lo usual):
-constexpr uint8_t RELAY_ON  = LOW;
+constexpr uint8_t RELAY_ON  = LOW;   // active-low típico
 constexpr uint8_t RELAY_OFF = HIGH;
 
-bool relayState[6] = {false, false, false, false, false, false}; // false=OFF, true=ON
+bool relayState[6] = {false,false,false,false,false,false};
 
 static void setRelay(int idx, bool on) {
   relayState[idx] = on;
   digitalWrite(RELAY_PINS[idx], on ? RELAY_ON : RELAY_OFF);
 }
-static void setAllRelays(bool on) {
-  for (int i = 0; i < 6; i++) setRelay(i, on);
-}
 
 // =====================
-// MOCK CLOCK (for now)
+// Helpers
 // =====================
-uint8_t hh = 12, mm = 0;
-bool blinkColon = true;
-unsigned long lastTick = 0, lastUi = 0;
-
-// =====================
-// WIFI STATE
-// =====================
-bool wifiTried = false;
-unsigned long lastWifiPrint = 0;
-
 static void printDegC() {
   display.write(248); // °
   display.print("C");
@@ -85,14 +84,13 @@ static void fmtFloat(char *out, size_t outLen, float v, int width = 4, int dec =
   }
 }
 
-void connectWiFi(uint32_t timeoutMs = 15000) {
-  wifiTried = true;
-
+static void connectWiFi(uint32_t timeoutMs = 15000) {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(false);
+  WiFi.setSleep(false);
 
-  Serial.printf("Connecting to WiFi SSID: %s\n", WIFI_SSID);
+  Serial.printf("Connecting WiFi: '%s'\n", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   uint32_t start = millis();
@@ -104,25 +102,43 @@ void connectWiFi(uint32_t timeoutMs = 15000) {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi connected ✅");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("RSSI: ");
-    Serial.println(WiFi.RSSI());
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    Serial.print("RSSI: "); Serial.println(WiFi.RSSI());
   } else {
     Serial.println("WiFi NOT connected ❌ (timeout)");
   }
 }
 
+static void setupOrResyncNTP() {
+  configTzTime(TZ_INFO, NTP1, NTP2, NTP3);
+  lastNtpResyncMs = millis();
+  Serial.printf("NTP configured/resync. TZ='%s'\n", TZ_INFO);
+}
+
+static bool timeIsValid() {
+  time_t now = time(nullptr);
+  return now > 1577836800; // 2020-01-01
+}
+
+static void getTimeHHMM(char out[6]) {
+  if (!timeIsValid()) { strncpy(out, "--:--", 6); return; }
+  struct tm t;
+  if (!getLocalTime(&t, 50)) { strncpy(out, "--:--", 6); return; }
+  snprintf(out, 6, "%02d:%02d", t.tm_hour, t.tm_min);
+}
+
+// =====================
+// UI
+// =====================
 void drawHeader() {
-  char buf[6];
-  snprintf(buf, sizeof(buf), "%02d%c%02d", hh, blinkColon ? ':' : ' ', mm);
+  char hhmm[6];
+  getTimeHHMM(hhmm);
 
   display.setTextSize(1);
   display.setTextColor(SH110X_WHITE);
   display.setCursor(0, 0);
-  display.print(buf);
+  display.print(hhmm);
 
-  // Estado sensores
   display.setCursor(50, 0);
   display.print("D1:");
   display.print((isnan(t1) || isnan(h1)) ? "--" : "OK");
@@ -138,7 +154,6 @@ void drawTempsAndHumidity() {
   fmtFloat(bT2, sizeof(bT2), t2);
   fmtFloat(bH2, sizeof(bH2), h2);
 
-  // Bloque 1
   display.setTextSize(1);
   display.setCursor(0, 8);
   display.print("T1:");
@@ -154,7 +169,6 @@ void drawTempsAndHumidity() {
   display.print(bH1);
   display.print("%");
 
-  // Bloque 2
   display.setTextSize(1);
   display.setCursor(0, 32);
   display.print("T2:");
@@ -172,22 +186,10 @@ void drawTempsAndHumidity() {
 }
 
 void drawBottomBar() {
-  // Izq: WiFi status
   display.setTextSize(1);
   display.setCursor(0, 56);
-  if (WiFi.status() == WL_CONNECTED) {
-    display.print("WiFi:OK ");
-    // RSSI aproximado
-    int rssi = WiFi.RSSI();
-    display.print(rssi);
-    display.print("dB");
-  } else if (wifiTried) {
-    display.print("WiFi:--");
-  } else {
-    display.print("WiFi:..");
-  }
+  display.print((WiFi.status() == WL_CONNECTED) ? "WiFi:OK" : "WiFi:--");
 
-  // Der: estado relés R:xxxxxx
   display.setCursor(78, 56);
   display.print("R:");
   for (int i = 0; i < 6; i++) display.print(relayState[i] ? '1' : '0');
@@ -201,82 +203,64 @@ void drawUI() {
   display.display();
 }
 
+// =====================
+// Setup / Loop
+// =====================
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== Terrario start ===");
 
-  // Relés: configurar y dejar OFF (lo primero)
+  // Relés OFF primero
   for (int i = 0; i < 6; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
     digitalWrite(RELAY_PINS[i], RELAY_OFF);
     relayState[i] = false;
   }
-  Serial.println("Relays init -> OFF");
 
   // OLED
   Wire.begin(PIN_SDA, PIN_SCL);
   oledOk = display.begin(OLED_ADDR, true);
   if (!oledOk) {
-    Serial.println("OLED NO detectado (revisar 3V3/GND/SDA21/SCL22)");
+    Serial.println("OLED NO detectado");
   } else {
     display.cp437(true);
     display.setTextWrap(false);
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(0, 0); display.println("Terrario");
-    display.setCursor(0, 10); display.println("Init...");
-    display.display();
   }
 
   // DHTs
   dht1.begin();
   delay(20);
   dht2.begin();
-  Serial.println("DHT init OK");
 
-  // WiFi (con timeout, no bloquea infinito)
+  // WiFi + NTP (sin esperas)
   connectWiFi(15000);
+  if (WiFi.status() == WL_CONNECTED) {
+    setupOrResyncNTP();
+  } else {
+    Serial.println("NTP skipped (no WiFi)");
+  }
 }
 
 void loop() {
   unsigned long now = millis();
 
-  // Mock clock
-  if (now - lastTick >= 1000) {
-    lastTick = now;
-    blinkColon = !blinkColon;
-    if (++mm >= 60) { mm = 0; hh = (hh + 1) % 24; }
+  // Re-sync NTP cada 24h (solo si hay WiFi)
+  if (WiFi.status() == WL_CONNECTED && (now - lastNtpResyncMs >= NTP_RESYNC_MS)) {
+    setupOrResyncNTP();
   }
 
   // Leer DHT cada 2s
   if (now - lastReadMs >= 2000) {
     lastReadMs = now;
 
-    float tt, hhx;
-    tt = dht1.readTemperature();
-    hhx = dht1.readHumidity();
+    float tt = dht1.readTemperature();
+    float hhx = dht1.readHumidity();
     if (!isnan(tt) && !isnan(hhx)) { t1 = tt; h1 = hhx; }
-    else Serial.println("DHT1: lectura invalida");
 
     tt = dht2.readTemperature();
     hhx = dht2.readHumidity();
     if (!isnan(tt) && !isnan(hhx)) { t2 = tt; h2 = hhx; }
-    else Serial.println("DHT2: lectura invalida");
-
-    Serial.printf("D1 T=%.1fC H=%.1f%% | D2 T=%.1fC H=%.1f%%\n", t1, h1, t2, h2);
-  }
-
-  // Log WiFi cada 5s si está conectado
-  if (now - lastWifiPrint >= 5000) {
-    lastWifiPrint = now;
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("WiFi OK | IP=%s | RSSI=%d dBm\n",
-                    WiFi.localIP().toString().c_str(),
-                    WiFi.RSSI());
-    } else {
-      Serial.println("WiFi not connected (aun).");
-    }
   }
 
   // UI
