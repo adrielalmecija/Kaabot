@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <time.h>
+#include "influx_client.h"
 #include "secrets.h"
 
 #include <Adafruit_GFX.h>
@@ -15,9 +16,7 @@
 // =====================
 // WIFI / NTP
 // =====================
-static const char* WIFI_SSID = WIFI_SSID_SECRET;
-static const char* WIFI_PASS = WIFI_PASS_SECRET;
-
+// Usamos WIFI_SSID / WIFI_PASS desde secrets.cpp (extern en secrets.h)
 static const char* TZ_INFO = "ART3";
 static const char* NTP1 = "pool.ntp.org";
 static const char* NTP2 = "time.google.com";
@@ -97,8 +96,6 @@ constexpr int LIGHT_OFF_MM = 0;
 // Calefacción (controla por T1)
 constexpr float SP_HEAT       = 29.0f;
 constexpr float HYST_MAIN     = 0.5f;
-constexpr float BED_ON_DELTA  = 1.0f;
-constexpr float LAMP_ON_DELTA = 2.0f;
 
 // Seguridad cama de calor (DS18B20)
 constexpr float BED_MAX_C     = 30.0f;
@@ -112,8 +109,17 @@ constexpr float HEAT_ENABLE_DELTA = 0.5f; // exige que T1 sea al menos 0.5°C me
 
 // ---- R3 incandescente (solo de día) ----
 constexpr float INC_ON_DELTA  = 1.2f; // enciende si T1 < SP - 1.2
-constexpr float INC_OFF_DELTA = 0.2f; // apaga si T1 >= SP - 0.2 (queda cerca del SP)
+constexpr float INC_OFF_DELTA = 0.2f; // apaga si T1 >= SP - 0.2
 
+// =====================
+// Influx scheduling
+// =====================
+static unsigned long lastInfluxSendMs = 0;
+static InfluxTelemetry lastInfluxSent = {
+  NAN, NAN, NAN, NAN, NAN,
+  {-1,-1,-1,-1,-1,-1},
+  0
+};
 
 // =====================
 // Helpers
@@ -133,7 +139,7 @@ static void forceRelay(int idx, bool on) {
 
 static bool timeIsValid() {
   time_t now = time(nullptr);
-  return now > 1577836800;
+  return now > 1577836800; // 2020-01-01
 }
 
 static bool getLocalHM(int &hh, int &mm) {
@@ -229,39 +235,28 @@ static void applyHeatingControl() {
     return;
   }
 
-  // -----------------------
   // R1 Cerámica (principal)
-  // Permitir ENCENDER solo si T2 indica que el "lado frío" no está más caliente.
-  // Si T2 es inválida, permitimos (para no quedarnos sin calefacción).
-  // -----------------------
   const bool t2Valid = !isnan(t2);
-  const bool heatAllowed = !t2Valid || (t1 <= (t2 - HEAT_ENABLE_DELTA));
+  const bool invertedGradient = t2Valid && (t2 > t1 + HEAT_ENABLE_DELTA);
+  const bool heatAllowed = !invertedGradient;
 
   bool ceramicOn = getRelay(R1_CERAMIC);
 
   if (ceramicOn) {
-    // Apagar normal por histéresis
     if (t1 >= (SP_HEAT + HYST_MAIN)) safeSetRelay(R1_CERAMIC, false);
-    // Extra: si se invierte el gradiente fuerte, también apagar (opcional)
     if (t2Valid && t2 > (t1 + 0.8f)) safeSetRelay(R1_CERAMIC, false);
   } else {
-    // Encender solo si está permitido
     if (heatAllowed && t1 <= (SP_HEAT - HYST_MAIN)) safeSetRelay(R1_CERAMIC, true);
   }
 
-  // -----------------------
   // R2 Cama (regla fija)
-  // -----------------------
   if (t1 < 26.5f) safeSetRelay(R2_BED, true);
   if (t1 > 27.5f) safeSetRelay(R2_BED, false);
 
-  // -----------------------
   // R3 Incandescente (solo de día, apoyo suave)
-  // -----------------------
   if (!isDaytime()) {
     safeSetRelay(R3_LAMP, false);
   } else {
-    // ON si baja bastante, OFF si vuelve cerca del objetivo
     if (t1 < (SP_HEAT - INC_ON_DELTA))  safeSetRelay(R3_LAMP, true);
     if (t1 >= (SP_HEAT - INC_OFF_DELTA)) safeSetRelay(R3_LAMP, false);
   }
@@ -285,7 +280,7 @@ static void drawRelayBlocks(int x, int y, int w, int h, int gap) {
   }
 }
 
-void drawDashboard() {
+static void drawDashboard() {
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
 
@@ -353,7 +348,7 @@ void drawDashboard() {
   display.display();
 }
 
-void drawUI() { drawDashboard(); }
+static void drawUI() { drawDashboard(); }
 
 // =====================
 // Setup / Loop
@@ -394,6 +389,9 @@ void setup() {
   // WiFi + NTP
   connectWiFi(15000);
   if (WiFi.status() == WL_CONNECTED) setupOrResyncNTP();
+
+  // Influx
+  influxInit();
 }
 
 void loop() {
@@ -429,6 +427,42 @@ void loop() {
   applyLightingControl();
   applyHeatingControl();
   applyBedSafety(); // corta cama si BED >= 30C
+
+  // InfluxDB: enviar telemetría (1 min con cambios, 5 min en reposo)
+  InfluxTelemetry cur;
+  cur.dht1_temp = t1;
+  cur.dht1_hum  = h1;
+  cur.dht2_temp = t2;
+  cur.dht2_hum  = h2;
+  cur.ds18_temp = tBed;
+
+  for (int i = 0; i < 6; i++) {
+    cur.relay[i] = relayState[i] ? 1 : 0;
+  }
+  cur.rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+
+  bool changed = influxHasMeaningfulChange(cur, lastInfluxSent);
+  if (changed) influxMarkChanged();
+
+  uint32_t interval = influxCurrentIntervalMs();
+  bool timeToSend = (now - lastInfluxSendMs >= interval);
+
+  if (timeToSend) {
+    if (WiFi.status() == WL_CONNECTED) {
+      bool ok = influxWrite(cur);
+      if (ok) {
+        lastInfluxSent = cur;
+        lastInfluxSendMs = now;
+        Serial.println("[Influx] OK");
+      } else {
+        Serial.println("[Influx] FAIL");
+        // reintento en ~5s sin martillar
+        lastInfluxSendMs = now - interval + 5000;
+      }
+    } else {
+      lastInfluxSendMs = now;
+    }
+  }
 
   // UI
   if (oledOk && (now - lastUi >= 250)) {
